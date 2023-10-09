@@ -484,7 +484,8 @@ class MOELayer(Base):
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
         print("in moe forward, 481, shard_moe.py")
-        print(input[0].shape)
+        print(input)
+        print(type(input))
         times = [input[0].shape[0], input[0].shape[1]]
         # start = torch.cuda.Event(enable_timing=True)
         # end = torch.cuda.Event(enable_timing=True)
@@ -544,6 +545,18 @@ class MOELayer(Base):
 
         # if groups._get_expert_model_parallel_world_size() != 1:
         # dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        print("dispatched_input shape: ", type(dispatched_input))
+        output = torch.empty_like(dispatched_input)
+        all_to_all_1_start = torch.cuda.Event(enable_timing=True)
+        all_to_all_1_end = torch.cuda.Event(enable_timing=True)
+        all_to_all_1_start.record()
+        torch.distributed.all_to_all_single(output=output.to(torch.int32),
+                                                   input=dispatched_input.to(torch.int32),
+                                                   output_split_sizes=None,
+                                                   input_split_sizes=None)
+        all_to_all_1_end.record()
+        torch.cuda.synchronize()
+        print("all_to_all took: {} ms".format(all_to_all_1_start.elapsed_time(all_to_all_1_end)))
         # b.record()
         # torch.cuda.synchronize()
         # print("alltoall: {} ms".format(a.elapsed_time(b)))
@@ -563,7 +576,17 @@ class MOELayer(Base):
             self.timers(SECOND_ALLTOALL_TIMER).start()
         # if groups._get_expert_model_parallel_world_size() != 1:
         # expert_output = _AllToAll.apply(self.ep_group, expert_output)
-
+        output = torch.empty_like(expert_output)
+        all_to_all_2_start = torch.cuda.Event(enable_timing=True)
+        all_to_all_2_end = torch.cuda.Event(enable_timing=True)
+        all_to_all_2_start.record()
+        torch.distributed.all_to_all_single(output=output.to(torch.int32),
+                                                   input=expert_output.to(torch.int32),
+                                                   output_split_sizes=None,
+                                                   input_split_sizes=None)
+        all_to_all_2_end.record()
+        torch.cuda.synchronize()
+        print("all_to_all took: {} ms".format(all_to_all_2_start.elapsed_time(all_to_all_2_end)))
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()
             self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
@@ -591,4 +614,5 @@ class MOELayer(Base):
         # torch.cuda.synchronize()
         # print("moe second half {} ms".format(end_aux_2.elapsed_time(end)))
         # print("moe forward pass took: {} ms".format(start.elapsed_time(end)))
+        times.append((all_to_all_1_start, all_to_all_1_end, all_to_all_2_start, all_to_all_2_end))
         return a, times

@@ -377,6 +377,8 @@ class InferenceEngine(Module):
         generic_injection(self.module, dtype=config.dtype, enable_cuda_graph=config.enable_cuda_graph)
 
         if isinstance(self.module, torch.nn.Module):
+            # print("ERROORRR")
+            # exit(0)
             # config is our DeepSpeedInferenceConfig and self.config is the HF model config
             replace_transformer_layer(client_module, self.module, checkpoint, config, self.config)
 

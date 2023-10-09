@@ -13,13 +13,18 @@ class Experts(torch.nn.Module):
         super(Experts, self).__init__()
 
         self.deepspeed_experts = torch.nn.ModuleList([copy.deepcopy(expert) for i in range(num_local_experts)])
+        # for i in self.deepspeed_experts:
+            # print("expert device: {}".format(i))
+        # exit(0)
         self.num_local_experts = num_local_experts
 
         # TODO: revisit allreduce for moe.gate...
         for expert in self.deepspeed_experts:
+            
             # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
             for name, param in expert.named_parameters():
-                param.allreduce = False
+                # print("param name: {}".format(name))
+                param.allreduce = True
                 param.group_name = expert_group_name
 
     def forward(self, inputs):
@@ -29,10 +34,15 @@ class Experts(torch.nn.Module):
         # start = torch.cuda.Event(enable_timing=True)
         # end = torch.cuda.Event(enable_timing=True)
         # l = []
+        count = 0
         for chunk, expert in zip(chunks, self.deepspeed_experts):
             # print("forward pass on expert")
             # print("chunk shape: {}".format(chunk.shape))
             # start.record()
+            count+= 1
+            # print("forward pass on expert {}".format(count))
+            print("GPU: {}".format(torch.cuda.current_device()))
+            # print("GPU check : {}".format(expert.device()))
             out = expert(chunk)
             if type(out) is tuple:
                 out = out[0]  # Ignore the bias term for now

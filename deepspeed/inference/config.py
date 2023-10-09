@@ -274,6 +274,7 @@ class DeepSpeedInferenceConfig(DeepSpeedConfigModel):
     transposed_mode: bool = Field(False, alias="transposed_mode")
 
     mp_size: int = Field(1, deprecated=True, new_param="tensor_parallel.tp_size")
+    print("mp_size", mp_size)
     """
     Desired model parallel size, default is 1 meaning no model parallelism.
     Deprecated, please use the ``tensor_parallel` config to control model
