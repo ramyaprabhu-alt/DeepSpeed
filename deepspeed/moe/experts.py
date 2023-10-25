@@ -24,7 +24,7 @@ class Experts(torch.nn.Module):
             # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
             for name, param in expert.named_parameters():
                 # print("param name: {}".format(name))
-                param.allreduce = True
+                param.allreduce = False
                 param.group_name = expert_group_name
 
     def forward(self, inputs):
@@ -43,6 +43,7 @@ class Experts(torch.nn.Module):
             # print("forward pass on expert {}".format(count))
             print("GPU: {}".format(torch.cuda.current_device()))
             # print("GPU check : {}".format(expert.device()))
+            print("chunk size", chunk.shape)
             out = expert(chunk)
             if type(out) is tuple:
                 out = out[0]  # Ignore the bias term for now

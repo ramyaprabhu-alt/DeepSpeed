@@ -26,6 +26,8 @@ import torch.nn.functional as F
 from deepspeed.utils import groups
 from .mappings import drop_tokens, gather_tokens
 import csv
+import numpy as np
+# import torch.profiler as Profiler
 
 if TYPE_CHECKING:
     Base = Module[Tensor]
@@ -454,7 +456,8 @@ class MOELayer(Base):
                  ep_group_name,
                  ep_size,
                  num_local_experts: int,
-                 use_tutel: bool = False) -> None:
+                 use_tutel: bool = False,
+                 py_prof: bool = False) -> None:
         super().__init__()
         self.gate = gate
         self.experts = experts
@@ -467,6 +470,7 @@ class MOELayer(Base):
         self.time_moe = 0.0
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
+        self.py_prof = py_prof
 
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
@@ -513,50 +517,66 @@ class MOELayer(Base):
             self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
         else:
-            a = torch.cuda.Event(enable_timing=True)
-            b = torch.cuda.Event(enable_timing=True)
-            a.record()
+            if self.py_prof:
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+                prof.__enter__()
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
             dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
-            b.record()
-            torch.cuda.synchronize()
-            t=a.elapsed_time(b)
-            print("moe forward pass gating: {} ms".format(t))
-            print("dispatched_input shape: ", dispatched_input.shape, dispatched_input[0].shape)
-            times.append(t)
-            # with open('prefill_thruput_.csv', 'a') as f_object:
-            #     writer_object = csv.writer(f_object)
-            #     writer_object.writerow(times)
-            # print("507 sharded_moe.py")
+            if self.py_prof:
+                prof.__exit__(None, None, None)
+                gating_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
 
         if self.wall_clock_breakdown:
             self.timers(FIRST_ALLTOALL_TIMER).start()
         # a = torch.cuda.Event(enable_timing=True)
         # b = torch.cuda.Event(enable_timing=True)
         # a.record()
-        if groups._get_expert_model_parallel_world_size() == 1:
+        # if groups._get_expert_model_parallel_world_size() == 1:
             # If the non-expert is tensor-parallel, it will create
             # duplicate tokens on the tensor-parallel ranks.
             # Since our experts are not tensor-parallel, these duplicates
             # need to be dropped to ensure correctness.
             # this also doubles up as a communication optimization as we are
             # reducing the all-to-all communication volume.
-            dispatched_input = drop_tokens(dispatched_input, dim=1)
+        if self.py_prof:
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU])
+                prof.__enter__()
+        if torch.distributed.get_world_size () > 1 and self.ep_size > 1:
+            print("world size :" , torch.distributed.get_world_size())
+            print("rank : ", torch.distributed.get_rank())
+            chunk_size = dispatched_input.shape[1] // torch.distributed.get_world_size()
+            dispatched_input=torch.narrow(dispatched_input, 1, torch.distributed.get_rank(), chunk_size)
+            # dispatched_input = drop_tokens(dispatched_input, dim=1)
 
         # if groups._get_expert_model_parallel_world_size() != 1:
         # dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
-        print("dispatched_input shape: ", type(dispatched_input))
-        output = torch.empty_like(dispatched_input)
-        all_to_all_1_start = torch.cuda.Event(enable_timing=True)
-        all_to_all_1_end = torch.cuda.Event(enable_timing=True)
-        all_to_all_1_start.record()
-        torch.distributed.all_to_all_single(output=output.to(torch.int32),
-                                                   input=dispatched_input.to(torch.int32),
-                                                   output_split_sizes=None,
-                                                   input_split_sizes=None)
-        all_to_all_1_end.record()
-        torch.cuda.synchronize()
-        print("all_to_all took: {} ms".format(all_to_all_1_start.elapsed_time(all_to_all_1_end)))
+
+        """
+            ********************************************************************
+            ----------------------------FIRST ALL TO ALL BEGIN------------------
+            ********************************************************************
+        """
+
+        print("dispatched_input shape: ", dispatched_input.shape)
+        if self.ep_size > 1:
+            output = torch.empty_like(dispatched_input)
+            all_to_all_1_start = torch.cuda.Event(enable_timing=True)
+            all_to_all_1_end = torch.cuda.Event(enable_timing=True)
+            all_to_all_1_start.record()
+            torch.distributed.all_to_all_single(output=output.to(torch.int32),
+                                                    input=dispatched_input.to(torch.int32),
+                                                    output_split_sizes=None,
+                                                    input_split_sizes=None)
+            all_to_all_1_end.record()
+            torch.cuda.synchronize()
+            print("all_to_all took: {} ms".format(all_to_all_1_start.elapsed_time(all_to_all_1_end)))
+
+        """
+            ********************************************************************
+            ----------------------------FIRST ALL TO ALL END------------------
+            ********************************************************************
+        """
+        
         # b.record()
         # torch.cuda.synchronize()
         # print("alltoall: {} ms".format(a.elapsed_time(b)))
@@ -566,47 +586,105 @@ class MOELayer(Base):
 
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, d_model)
+        if self.py_prof:
+                prof.__exit__(None, None, None)
+                reshape_n_comm_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
+        # dispatched_input = dispatched_input.reshape(1, self.num_local_experts, -1, d_model)
         # end_aux.record()
         # torch.cuda.synchronize()
         # print("moe forward pass first pass: {} ms".format(start.elapsed_time(end_aux)))
+        print("dispatched_input shape: ", dispatched_input.shape, dispatched_input[0].shape)
+        """
+            ********************************************************************
+            -----------------------CALL TO EXPERTS BEGINS HERE------------------
+            ********************************************************************
+        """
         expert_output = self.experts(dispatched_input)
+        """
+            ********************************************************************
+            -----------------------CALL TO EXPERTS ENDS HERE--------------------
+            ********************************************************************
+        """
         # end_aux_2 = torch.cuda.Event(enable_timing=True)
         # end_aux_2.record()
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).start()
         # if groups._get_expert_model_parallel_world_size() != 1:
         # expert_output = _AllToAll.apply(self.ep_group, expert_output)
-        output = torch.empty_like(expert_output)
-        all_to_all_2_start = torch.cuda.Event(enable_timing=True)
-        all_to_all_2_end = torch.cuda.Event(enable_timing=True)
-        all_to_all_2_start.record()
-        torch.distributed.all_to_all_single(output=output.to(torch.int32),
-                                                   input=expert_output.to(torch.int32),
-                                                   output_split_sizes=None,
-                                                   input_split_sizes=None)
-        all_to_all_2_end.record()
-        torch.cuda.synchronize()
-        print("all_to_all took: {} ms".format(all_to_all_2_start.elapsed_time(all_to_all_2_end)))
+
+        """
+            ********************************************************************
+            ----------------------------SECOND ALL TO ALL BEGIN------------------
+            ********************************************************************
+        """
+
+        if self.ep_size > 1:
+            output = torch.empty_like(expert_output)
+            all_to_all_2_start = torch.cuda.Event(enable_timing=True)
+            all_to_all_2_end = torch.cuda.Event(enable_timing=True)
+            all_to_all_2_start.record()
+
+            torch.distributed.all_to_all_single(output=output.to(torch.int32),
+                                                    input=expert_output.to(torch.int32),
+                                                    output_split_sizes=None,
+                                                    input_split_sizes=None)
+            all_to_all_2_end.record()
+            torch.cuda.synchronize()
+            print("all_to_all took: {} ms".format(all_to_all_2_start.elapsed_time(all_to_all_2_end)))
+        
+        """
+            ********************************************************************
+            ----------------------------SECOND ALL TO ALL END------------------
+            ********************************************************************
+        """
+
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()
             self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
 
+        if self.py_prof:
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+                prof.__enter__()
         # Re-shape back: gecm -> ecm
+        print("expert_output shape: ", expert_output.shape)
+        print(expert_output)
         expert_output = expert_output.reshape(self.ep_size * self.num_local_experts, -1, d_model)
 
-        if groups._get_expert_model_parallel_world_size() == 1:
-            # the dropped duplicate tokens need to be gathered on each
-            # tensor parallel rank again for the tensor-parallel
-            # non-expert of the next layer.
-            expert_output = gather_tokens(expert_output, dim=1)
-
+        # if groups._get_expert_model_parallel_world_size() == 1:
+        #     # the dropped duplicate tokens need to be gathered on each
+        #     # tensor parallel rank again for the tensor-parallel
+        #     # non-expert of the next layer.
+        #     expert_output = gather_tokens(expert_output, dim=1)
+        if torch.distributed.get_world_size () > 1 and self.ep_size > 1:
+            expert_output = expert_output.contiguous()
+            rank = torch.distributed.get_rank()
+            tensor_list = [torch.empty_like(expert_output) for _ in range(torch.distributed.get_world_size())]
+            tensor_list[rank] = expert_output
+            # output = torch.empty_like(expert_output)
+            torch.distributed.all_gather(tensor_list, expert_output)
+            expert_output = torch.cat(tensor_list, dim=1).contiguous()
+        if self.py_prof:
+                prof.__exit__(None, None, None)
+                gather_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
+        
         if self.use_tutel:
             combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
         else:
+            if self.py_prof:
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+                prof.__enter__()
+            print("expert_output shape: ", expert_output.shape)
+            print("combine_weights shape: ", combine_weights.shape)
             combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
-
+            if self.py_prof:
+                prof.__exit__(None, None, None)
+                combine_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
         a = combined_output.reshape(input[0].shape)
-
+        # with open('tensor_moe_1.txt', 'a') as f_object:
+        #     writer_object = csv.writer(f_object)
+        #     writer_object.writerow(a) 
+        # array = a.cpu().numpy()
+        # np.savetxt("tensor_moe_2.txt", array.reshape(-1), delimiter=",")
         if self.wall_clock_breakdown:
             self.timers(MOE_TIMER).stop()
             self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
@@ -614,5 +692,9 @@ class MOELayer(Base):
         # torch.cuda.synchronize()
         # print("moe second half {} ms".format(end_aux_2.elapsed_time(end)))
         # print("moe forward pass took: {} ms".format(start.elapsed_time(end)))
-        times.append((all_to_all_1_start, all_to_all_1_end, all_to_all_2_start, all_to_all_2_end))
+        if self.py_prof:
+            times.append((gating_cuda_time, reshape_n_comm_cuda_time, gather_cuda_time, combine_cuda_time))
+        # print("rank: ", torch.distributed.get_rank(), " a: ", a.shape)
+        # array = a.cpu().numpy()
+        # np.savetxt(f"{torch.distributed.get_world_size()}_GPU_tensor_moe_{torch.distributed.get_rank()}_bothALL_TO_ALL.txt", array.reshape(-1), delimiter=",")
         return a, times
