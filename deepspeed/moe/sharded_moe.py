@@ -557,19 +557,19 @@ class MOELayer(Base):
             ********************************************************************
         """
 
-        print("dispatched_input shape: ", dispatched_input.shape)
-        if self.ep_size > 1:
-            output = torch.empty_like(dispatched_input)
-            all_to_all_1_start = torch.cuda.Event(enable_timing=True)
-            all_to_all_1_end = torch.cuda.Event(enable_timing=True)
-            all_to_all_1_start.record()
-            torch.distributed.all_to_all_single(output=output.to(torch.int32),
-                                                    input=dispatched_input.to(torch.int32),
-                                                    output_split_sizes=None,
-                                                    input_split_sizes=None)
-            all_to_all_1_end.record()
-            torch.cuda.synchronize()
-            print("all_to_all took: {} ms".format(all_to_all_1_start.elapsed_time(all_to_all_1_end)))
+        # print("dispatched_input shape: ", dispatched_input.shape)
+        # if self.ep_size > 1:
+        #     output = torch.empty_like(dispatched_input)
+        #     all_to_all_1_start = torch.cuda.Event(enable_timing=True)
+        #     all_to_all_1_end = torch.cuda.Event(enable_timing=True)
+        #     all_to_all_1_start.record()
+        #     torch.distributed.all_to_all_single(output=output.to(torch.int32),
+        #                                             input=dispatched_input.to(torch.int32),
+        #                                             output_split_sizes=None,
+        #                                             input_split_sizes=None)
+        #     all_to_all_1_end.record()
+        #     torch.cuda.synchronize()
+        #     print("all_to_all took: {} ms".format(all_to_all_1_start.elapsed_time(all_to_all_1_end)))
 
         """
             ********************************************************************
@@ -618,19 +618,19 @@ class MOELayer(Base):
             ********************************************************************
         """
 
-        if self.ep_size > 1:
-            output = torch.empty_like(expert_output)
-            all_to_all_2_start = torch.cuda.Event(enable_timing=True)
-            all_to_all_2_end = torch.cuda.Event(enable_timing=True)
-            all_to_all_2_start.record()
+        # if self.ep_size > 1:
+        #     output = torch.empty_like(expert_output)
+        #     all_to_all_2_start = torch.cuda.Event(enable_timing=True)
+        #     all_to_all_2_end = torch.cuda.Event(enable_timing=True)
+        #     all_to_all_2_start.record()
 
-            torch.distributed.all_to_all_single(output=output.to(torch.int32),
-                                                    input=expert_output.to(torch.int32),
-                                                    output_split_sizes=None,
-                                                    input_split_sizes=None)
-            all_to_all_2_end.record()
-            torch.cuda.synchronize()
-            print("all_to_all took: {} ms".format(all_to_all_2_start.elapsed_time(all_to_all_2_end)))
+        #     torch.distributed.all_to_all_single(output=output.to(torch.int32),
+        #                                             input=expert_output.to(torch.int32),
+        #                                             output_split_sizes=None,
+        #                                             input_split_sizes=None)
+        #     all_to_all_2_end.record()
+        #     torch.cuda.synchronize()
+        #     print("all_to_all took: {} ms".format(all_to_all_2_start.elapsed_time(all_to_all_2_end)))
         
         """
             ********************************************************************

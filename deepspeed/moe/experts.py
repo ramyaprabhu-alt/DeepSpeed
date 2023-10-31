@@ -5,14 +5,21 @@
 
 import torch
 import copy
-
+import copyreg
 
 class Experts(torch.nn.Module):
 
     def __init__(self, expert, num_local_experts=1, expert_group_name=None):
         super(Experts, self).__init__()
+        print("in experts.py __init__")
+        print("expert type: {}".format(type(expert)))
+        try:
+            self.deepspeed_experts = torch.nn.ModuleList([copy.deepcopy(expert) for i in range(num_local_experts)])
+        except:
+            copyreg.pickle(expert.__class__, expert.pickle_myself, expert.unpickle_myself)
+            self.deepspeed_experts = torch.nn.ModuleList([copy.deepcopy(expert) for i in range(num_local_experts)])
+      
 
-        self.deepspeed_experts = torch.nn.ModuleList([copy.deepcopy(expert) for i in range(num_local_experts)])
         # for i in self.deepspeed_experts:
             # print("expert device: {}".format(i))
         # exit(0)
