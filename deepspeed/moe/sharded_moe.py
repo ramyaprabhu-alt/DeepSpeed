@@ -457,7 +457,8 @@ class MOELayer(Base):
                  ep_size,
                  num_local_experts: int,
                  use_tutel: bool = False,
-                 py_prof: bool = False) -> None:
+                 py_prof: bool = False,
+                 debug: bool = False) -> None:
         super().__init__()
         self.gate = gate
         self.experts = experts
@@ -471,6 +472,7 @@ class MOELayer(Base):
         self.timers = SynchronizedWallClockTimer()
         self.wall_clock_breakdown = False
         self.py_prof = py_prof
+        self.debug = debug
 
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
@@ -487,9 +489,10 @@ class MOELayer(Base):
         self.ep_group = ep_group
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
-        print("in moe forward, 481, shard_moe.py")
-        print(input)
-        print(type(input))
+        if self.debug:
+            print("in moe forward, 481, shard_moe.py")
+            print(input)
+            print(type(input))
         times = [input[0].shape[0], input[0].shape[1]]
         # start = torch.cuda.Event(enable_timing=True)
         # end = torch.cuda.Event(enable_timing=True)
@@ -506,7 +509,8 @@ class MOELayer(Base):
         # Reshape into G groups so that each group can distribute tokens equally
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
-        print(reshaped_input.shape)
+        if self.debug:
+            print(reshaped_input.shape)
 
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
@@ -528,9 +532,6 @@ class MOELayer(Base):
 
         if self.wall_clock_breakdown:
             self.timers(FIRST_ALLTOALL_TIMER).start()
-        # a = torch.cuda.Event(enable_timing=True)
-        # b = torch.cuda.Event(enable_timing=True)
-        # a.record()
         # if groups._get_expert_model_parallel_world_size() == 1:
             # If the non-expert is tensor-parallel, it will create
             # duplicate tokens on the tensor-parallel ranks.
@@ -542,8 +543,9 @@ class MOELayer(Base):
                 prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU])
                 prof.__enter__()
         if torch.distributed.get_world_size () > 1 and self.ep_size > 1:
-            print("world size :" , torch.distributed.get_world_size())
-            print("rank : ", torch.distributed.get_rank())
+            if self.debug:
+                print("world size :" , torch.distributed.get_world_size())
+                print("rank : ", torch.distributed.get_rank())
             chunk_size = dispatched_input.shape[1] // torch.distributed.get_world_size()
             dispatched_input=torch.narrow(dispatched_input, 1, torch.distributed.get_rank(), chunk_size)
             # dispatched_input = drop_tokens(dispatched_input, dim=1)
@@ -593,7 +595,8 @@ class MOELayer(Base):
         # end_aux.record()
         # torch.cuda.synchronize()
         # print("moe forward pass first pass: {} ms".format(start.elapsed_time(end_aux)))
-        print("dispatched_input shape: ", dispatched_input.shape, dispatched_input[0].shape)
+        if self.debug:
+            print("dispatched_input shape: ", dispatched_input.shape, dispatched_input[0].shape)
         """
             ********************************************************************
             -----------------------CALL TO EXPERTS BEGINS HERE------------------
@@ -646,8 +649,9 @@ class MOELayer(Base):
                 prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
                 prof.__enter__()
         # Re-shape back: gecm -> ecm
-        print("expert_output shape: ", expert_output.shape)
-        print(expert_output)
+        if self.debug:
+            print("expert_output shape: ", expert_output.shape)
+            print(expert_output)
         expert_output = expert_output.reshape(self.ep_size * self.num_local_experts, -1, d_model)
 
         # if groups._get_expert_model_parallel_world_size() == 1:
@@ -673,8 +677,9 @@ class MOELayer(Base):
             if self.py_prof:
                 prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
                 prof.__enter__()
-            print("expert_output shape: ", expert_output.shape)
-            print("combine_weights shape: ", combine_weights.shape)
+            if self.debug:
+                print("expert_output shape: ", expert_output.shape)
+                print("combine_weights shape: ", combine_weights.shape)
             combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
             if self.py_prof:
                 prof.__exit__(None, None, None)

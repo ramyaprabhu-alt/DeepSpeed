@@ -48,7 +48,9 @@ class MoE(torch.nn.Module):
                  use_rts=True,
                  use_tutel: bool = False,
                  enable_expert_tensor_parallelism: bool = False,
-                 py_prof: bool = False):
+                 py_prof: bool = False,
+                 debug: bool = False,
+                 ):
 
         super(MoE, self).__init__()
 
@@ -75,7 +77,8 @@ class MoE(torch.nn.Module):
                                       self.ep_size,
                                       self.num_local_experts,
                                       use_tutel=use_tutel,
-                                      py_prof = py_prof)
+                                      py_prof = py_prof,
+                                      debug = debug)
         if self.use_residual:
             self.mlp = expert
             # coefficient is used for weighted sum of the output of expert and mlp
