@@ -108,9 +108,11 @@ class CausalSelfAttention(nn.Module):
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-  
+        y = self.c_proj(y)
+        if y.shape[1]>args.seq_len:
+            y = y[:,:1,:]
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(y)
   
         return y
 
