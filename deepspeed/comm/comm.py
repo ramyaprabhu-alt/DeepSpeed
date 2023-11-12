@@ -625,8 +625,6 @@ def init_distributed(dist_backend=None,
         world_size: Optional (int). Desired world_size for the TCP or Shared file-system initialization.
     '''
     global cdb
-    print("Init method:")
-    print(init_method)
     configure(deepspeed_config=config)
     if dist_init_required is None:
         dist_init_required = cdb is None or not cdb.is_initialized()

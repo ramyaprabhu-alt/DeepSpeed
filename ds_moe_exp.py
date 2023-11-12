@@ -20,6 +20,7 @@ parser.add_argument('--dropout', dest='dropout', default=0.0, type = float, help
 parser.add_argument('--ep_size', dest='ep_size', default=1,type=int, help='Hidden Size')
 parser.add_argument('--is_moe', dest = 'is_moe', action='store_true')
 parser.set_defaults(is_moe=False)
+parser.add_argument('--use_cache', dest = 'use_cache', action='store_true')
 parser.add_argument('--top_k_val', dest='top_k_val', default=2, type = int,help='Hidden Size')
 parser.add_argument('--block_size', dest='block_size', default=1024, type = int, help='Hidden Size')
 parser.add_argument('--n_layers', dest='n_layers', default=1, type = int, help='Hidden Size')
@@ -152,7 +153,7 @@ class Block(nn.Module):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        x= self.attn(self.ln_1(x), kv_cache = True, cache = self.kv_cache)
+        x= self.attn(self.ln_1(x), kv_cache = args.use_cache, cache = self.kv_cache)
         # x = x+y
         end.record()
         torch.cuda.synchronize()
@@ -212,6 +213,7 @@ class Model(nn.Module):
             ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
+    @torch.no_grad()
     def forward(self, idx, targets=None):
         device = idx.device
         b, t, c = idx.size()
@@ -249,7 +251,7 @@ print(args)
 config = TFRMRConfig(args)
 model = Model(config)
 # model.half()
-model.eval()
+print(model.eval())
 model.half()
 model.to("cuda")
 deepspeed.init_distributed()
