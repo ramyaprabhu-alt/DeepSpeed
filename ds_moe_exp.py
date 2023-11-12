@@ -263,7 +263,7 @@ top_k = 5
 TIME = []
 TIME_1 = []
 TIME_2 = []
-for i in range(10):
+for i in range(3):
     #x = random.randn(1, size=(config.batch_size,256, config.n_embd))
     #y = random.randint(100, size=(config.batch_size,1, config.n_embd))
     # idx = torch.randint(high = 51200, size=(config.batch_size, config.seq_len), dtype=torch.half, device = "cuda")
@@ -282,6 +282,7 @@ for i in range(10):
                 logits , _, t2, t3 = model(idx)
                 end.record()
                 torch.cuda.synchronize()
+                print(idx.shape)
                 t=start.elapsed_time(end)
                 time.append(t)
                 time_1.append(t2)
