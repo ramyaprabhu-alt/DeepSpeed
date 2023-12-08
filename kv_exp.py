@@ -29,6 +29,11 @@ parser.add_argument('--max_gen_tokens', dest='max_gen_tokens', default=5, type=i
 parser.add_argument('--seq_len', dest='seq_len', default=1024, type = int,help='Hidden Size')
 parser.add_argument('--cap_fact', dest='capacity_factor', default=1.0, type = float,help='Hidden Size')
 parser.add_argument('--file_name', dest='file_name', default=None, type = str,help='Hidden Size')
+parser.add_argument('--offload_kv_cache', dest = 'offload_kv_cache', action='store_true')
+parser.set_defaults(offload_kv_cache=False)
+parser.add_argument('--moe_freq', dest='moe_freq', default=1, type = int,help='Hidden Size')
+parser.add_argument('--moe_top_k', dest='moe_top_k', default=1, type = int,help='Hidden Size')
+parser.add_argument('--batch_chunking', dest = 'batch_chunking', action='store_true')
 args = parser.parse_args()
 
 import deepspeed
@@ -71,14 +76,34 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        if not kv_cache or cache == {}:
+        if (not kv_cache or cache == {}) or (kv_cache and x.shape[1]==args.seq_len and args.batch_chunking):
             q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
             k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
             if(kv_cache):
-                cache["prev_k"] = k
-                cache["prev_v"] = v
+                print("shape kv : ", k.shape, v.shape)
+                if not args.batch_chunking:
+                    cache["prev_k"] = k
+                    cache["prev_v"] = v
+                    if args.offload_kv_cache:
+                        cache["prev_k"].to("cpu", non_blocking=True)
+                        cache["prev_v"].to("cpu", non_blocking=True)
+                elif args.batch_chunking and x.shape[1]==args.seq_len:
+                    if cache != {}:
+                        
+                        cache["prev_k"] = torch.cat((cache["prev_k"], k), dim = 0)
+                        cache["prev_v"] = torch.cat((cache["prev_v"], v), dim = 0)
+                        print("prev shape kv after 2nd prompt : ", cache["prev_k"].shape, cache["prev_v"].shape)
+                    else:
+                        cache["prev_k"] = k
+                        cache["prev_v"] = v
+                if args.offload_kv_cache:
+                    cache["prev_k"].to("cpu", non_blocking=True)
+                    cache["prev_v"].to("cpu", non_blocking=True)
+            
+            
+                    
         else:
             q, k, v  = self.c_attn(x[:,-1,:].reshape(B,1,C)).split(self.n_embd, dim=2)
             k = k.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -89,8 +114,13 @@ class CausalSelfAttention(nn.Module):
             v_prev = cache["prev_v"]
             if(kv_cache):
                 assert bool(cache)
+                print("prev shape kv : ", k_prev.shape, v_prev.shape)
+
                 cache["prev_k"] = torch.cat((cache["prev_k"], k), dim = 2)
                 cache["prev_v"] = torch.cat((cache["prev_v"], v), dim = 2)
+                if args.offload_kv_cache:
+                    cache["prev_k"].to("cpu", non_blocking=True)
+                    cache["prev_v"].to("cpu", non_blocking=True)
                 k = torch.cat((k_prev, k), dim = 2)
                 v = torch.cat((v_prev, v), dim = 2)
                
@@ -99,7 +129,9 @@ class CausalSelfAttention(nn.Module):
             # print("flash be flashin")
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        
+            del k
+            del q
+            del v
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -140,6 +172,8 @@ class Block(nn.Module):
         # x = torch.Tensor(random.randint(100, size=(config.batch_size,config.block_size+config.max_gen_tokens, config.n_embd))).to("cuda")
         if args.use_cache:
             self.kv_cache =  {}
+        else:
+            self.prev_act = None
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -156,34 +190,57 @@ class Block(nn.Module):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        x= self.attn(self.ln_1(x), kv_cache = args.use_cache, cache = self.kv_cache)
+        # assert x.shape[1] != 1
+        print("b4 attn: ",x.shape)
+        if args.use_cache:
+            x= self.attn(self.ln_1(x), kv_cache = args.use_cache, cache = self.kv_cache)
+        else:
+            x= self.attn(self.ln_1(x), kv_cache = args.use_cache, cache = {})
         # x = x+y
         end.record()
         torch.cuda.synchronize()
         t = start.elapsed_time(end)
+                
        
         # print(type(x))
+      
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        if not config.is_moe: 
+        if type(self.mlp) == MLP: 
+            print("b4 MLP: ",x.shape)
             x = self.mlp(self.ln_2(x))
-        elif config.is_moe:
+        elif type(self.mlp) == deepspeed.moe.layer.MoE:
             # print("139")
-            # print(x.shape)
+            print("b4 MLP: ",x.shape)
             y = self.mlp(self.ln_2(x))
             x = y[0][0]
+            del y
         else:
             raise NotImplementedError
         end.record()
         torch.cuda.synchronize()
         t2 = start.elapsed_time(end)
-        if config.is_moe:
-            del y
+        if not args.use_cache:
+            if x.shape[1] == 1:
+                print("x shape: ", x.shape, self.prev_act.shape)
+                x = torch.cat((self.prev_act, x), dim = 1)
+                self.prev_act = x
+            if args.batch_chunking and x.shape[1]==args.seq_len:
+                if self.prev_act is None:
+                    self.prev_act = x
+                else:
+                    self.prev_act = torch.cat((self.prev_act, x), dim = 0)
+
         return x, t, t2
     
     def clear_cache(self):
-        self.kv_cache = {}
+        print("clearing cache")
+        print(args.use_cache)
+        if args.use_cache:
+            self.kv_cache = {}
+        else:
+            self.prev_act = None
 
 class TFRMRConfig():
     def __init__(self, args):   
@@ -209,13 +266,27 @@ class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
         self.config =  config
+        h_ = nn.ModuleList()
+        if config.is_moe:
+            for i in range(config.n_layers):
+                is_moe = (i)%args.moe_freq == 0
+                if not is_moe:
+                    config.is_moe = False
+                    h_.append(Block(config))
+                    config.is_moe = True
+                else:
+                    h_.append(Block(config))
+        else:
+            h_ = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
+                    
         self.transformer = nn.ModuleDict(dict(
                 # wte = nn.Embedding(config.vocab_size, config.n_embd, dtype=torch.half).to(torch.half),
                 # wpe = nn.Embedding(config.block_size, config.n_embd, dtype=torch.half),
                 # drop = nn.Dropout(config.dropout),
-                h = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
+                h = h_,
                 ln_f = LayerNorm(config.n_embd, bias=config.bias),
             ))
+        del h_
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
     @torch.no_grad()
@@ -230,8 +301,25 @@ class Model(nn.Module):
         # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         # x = self.transformer.drop(tok_emb + pos_emb)
         x = idx
-        for block in self.transformer.h:
-            x,t, t2 = block(x)
+        t_attn = 0
+        t_mlp = 0
+        for id_b, block in enumerate(self.transformer.h):
+            next_kv_id = (id_b+1) % len(self.transformer.h)
+            if args.offload_kv_cache:
+                if self.transformer.h[next_kv_id].kv_cache :
+                    self.transformer.h[next_kv_id].kv_cache['prev_k'].to("cuda", non_blocking=True)
+                    self.transformer.h[next_kv_id].kv_cache['prev_v'].to("cuda", non_blocking=True)
+            if args.batch_chunking and x.shape[1]==args.seq_len:
+                for req in range(x.shape[0]):
+                    tmp, t, t2 = block(x[req].view(1,-1,config.n_embd))
+                    x[req] = tmp.view(-1, config.n_embd)
+                    del tmp
+                    t_attn += t
+                    t_mlp += t2
+            else:
+                x,t, t2 = block(x)
+                t_attn += t
+                t_mlp += t2
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -244,7 +332,7 @@ class Model(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
         del idx
-        return logits, loss, t, t2
+        return logits, loss, t_attn, t_mlp
      
     def clear_cache(self):
         for block in self.transformer.h:
@@ -306,6 +394,7 @@ for i in range(3):
                 # print(idx)
                 # print(idx.shape)            
                 idx = torch.cat((idx, y), dim=1)
+                del probs, logits, idx_next
 
 
     TIME.append(time)

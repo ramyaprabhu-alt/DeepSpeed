@@ -129,7 +129,12 @@ USE_EINSUM = True
 # See https://arxiv.org/pdf/2006.16668.pdf for details.
 def einsum(rule, a, b):
     if USE_EINSUM:
-        return torch.einsum(rule, a, b)
+        # print("shape of a: ", a.shape)
+        # print("shape of b: ", b.shape)
+        # print("rule: ", rule)
+        mul = torch.einsum(rule, a, b)
+        # print(" Shape of mul : ", mul.shape)
+        return mul
     elif rule == 's,se->se':
         return a.reshape(a.shape[0], -1) * b
     elif rule == 'se,sc->sec':
@@ -141,7 +146,13 @@ def einsum(rule, a, b):
         e = a.shape[1]
         c = a.shape[2]
         m = b.shape[1]
-        return torch.matmul(a.reshape(s, -1).t(), b).reshape(e, c, m)
+        # print(" Shape of a : ", a.reshape(s, -1).t().shape)
+        # print(" Shape of b : ", b)
+
+        mul = torch.matmul(a.reshape(s, -1).t(), b).reshape(e, c, m)
+        # print(" Shape of mul : ", mul.shape)
+        return mul
+
     elif rule == 'sec,ecm->sm':
         return torch.matmul(a.reshape(a.shape[0], -1), b.reshape(-1, b.shape[-1]))
     elif rule == 'ks,ksm->sm':
@@ -155,6 +166,7 @@ def einsum(rule, a, b):
         # bmm([s, 1, k], [s, m, k]^t) -> [s, m, 1]
         return torch.bmm(a, b.transpose(1, 2)).squeeze(2)
     else:
+        print("Rule not found")
         return torch.einsum(rule, a, b)
 
 
@@ -286,29 +298,31 @@ def top1gating(logits: Tensor,
 
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
-
 def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements Top2Gating on logits."""
-    # everything is in fp32 in this function
+    mem_0 = torch.cuda.memory_allocated()
+    # print("logits shape: ", logits.shape)
     gates = F.softmax(logits, dim=1)
-    # print("in here, 285")
-
+        
     capacity = _capacity(gates, torch.tensor(capacity_factor * 2), torch.tensor(min_capacity))
 
     # Create a mask for 1st's expert per token
     indices1_s = torch.argmax(gates, dim=1)
     num_experts = int(gates.shape[1])
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
-
+    
     # Create a mask for 2nd's expert per token using Gumbel-max trick
     # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
     logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
-    # Replace top-expert with min value
-    logits_except1 = logits_w_noise.masked_fill(mask1.bool(), float("-inf"))
+    
+    logits_except1 = logits_w_noise.masked_fill(mask1.bool() , float("-inf"))
     indices2_s = torch.argmax(logits_except1, dim=1)
     mask2 = F.one_hot(indices2_s, num_classes=num_experts)
+    del indices2_s
+    del indices1_s
+    del logits_w_noise
+    del logits_except1
 
-    # Compute locations in capacity buffer
     locations1 = torch.cumsum(mask1, dim=0) - 1
     locations2 = torch.cumsum(mask2, dim=0) - 1
     # Update 2nd's location by accounting for locations of 1st
@@ -321,36 +335,36 @@ def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tup
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
     l_aux = torch.mean(me * ce) * num_experts * num_experts
-
-    # Remove locations outside capacity from mask
+    
     mask1 *= torch.lt(locations1, capacity)
     mask2 *= torch.lt(locations2, capacity)
 
     # Store the capacity location for each token
     locations1_s = torch.sum(locations1 * mask1, dim=1)
     locations2_s = torch.sum(locations2 * mask2, dim=1)
-
-    # Normalize gate probabilities
-    mask1_float = mask1.float()
-    mask2_float = mask2.float()
-    gates1_s = einsum("se,se->s", gates, mask1_float)
-    gates2_s = einsum("se,se->s", gates, mask2_float)
+    del locations1, locations2
+    
+    gates1_s = einsum("se,se->s", gates, mask1.float())
+    gates2_s = einsum("se,se->s", gates, mask2.float())
+    del gates
     denom_s = gates1_s + gates2_s
     # Avoid divide-by-zero
     denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
     gates1_s /= denom_s
     gates2_s /= denom_s
-
+   
     # Calculate combine_weights and dispatch_mask
-    gates1 = einsum("s,se->se", gates1_s, mask1_float)
-    gates2 = einsum("s,se->se", gates2_s, mask2_float)
+    gates1 = einsum("s,se->se", gates1_s, mask1.float())
+    gates2 = einsum("s,se->se", gates2_s, mask2.float())
     locations1_sc = _one_hot_to_float(locations1_s, capacity)
     locations2_sc = _one_hot_to_float(locations2_s, capacity)
     combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
     combine2_sec = einsum("se,sc->sec", gates2, locations2_sc)
+    del gates1, gates2, locations1_sc, locations2_sc
     combine_weights = combine1_sec + combine2_sec
     dispatch_mask = combine_weights.bool()
-    
+    mem_1 = torch.cuda.memory_allocated()
+    # print("gating mem_0: ", mem_0, " mem_1: ", mem_1)
 
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
@@ -415,13 +429,16 @@ class TopKGate(Module):
         if self.noisy_gate_policy == 'Jitter' and self.training:
             input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
         logits = self.wg(input_fp32)
+        del input_fp32
 
         if self.k == 1:
+        #     print("top1gating")
             gate_output = top1gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity, used_token, self.noisy_gate_policy if self.training else None,
                                      self.drop_tokens, self.use_rts, use_tutel)
 
         else:
+            # print("top2gating")
             gate_output = top2gating(logits, self.capacity_factor if self.training else self.eval_capacity_factor,
                                      self.min_capacity)
 
@@ -489,28 +506,18 @@ class MOELayer(Base):
         self.ep_group = ep_group
 
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
-        if self.debug:
-            print("in moe forward, 481, shard_moe.py")
-            print(input)
-            print(type(input))
-        times = [input[0].shape[0], input[0].shape[1]]
-        # start = torch.cuda.Event(enable_timing=True)
-        # end = torch.cuda.Event(enable_timing=True)
-        # end_aux = torch.cuda.Event(enable_timing=True)
-        # start.record()
-        if self.wall_clock_breakdown:
-            print("wall clock breakdown")
-            self.timers(MOE_TIMER).start()
-
-        # Implement Algorithm 2 from GShard paper.
+              
+        mem_0 = torch.cuda.memory_allocated()
+        timers = [input[0].shape[0], input[0].shape[1]]
         d_model = input[0].shape[-1]
-
+        
         # Initial implementation -> Reshape into S tokens by dropping sequence dimension.
         # Reshape into G groups so that each group can distribute tokens equally
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
-        if self.debug:
-            print(reshaped_input.shape)
+        mem_1 = torch.cuda.memory_allocated()
+        input_shape = input[0].shape
+
 
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
@@ -521,17 +528,32 @@ class MOELayer(Base):
             self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
         else:
+
             if self.py_prof:
                 prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
                 prof.__enter__()
+            
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            # print("input shape: ", input[0].shape)
+            # print("reshaped_input shape: ", reshaped_input.shape)
+            # print("combine_weights shape: ", combine_weights.shape)
+            # print("dispatch_mask shape: ", dispatch_mask.shape)
+            start_aux = torch.cuda.Event(enable_timing=True)
+            end_aux = torch.cuda.Event(enable_timing=True)
+            mem_3 = torch.cuda.memory_allocated()
+            start_aux.record()
             dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
+            del dispatch_mask
+            del reshaped_input
+            end_aux.record()
+            torch.cuda.synchronize()
+            # print("moe forward pass first pass: {} ms".format(start_aux.elapsed_time(end_aux)))
             if self.py_prof:
                 prof.__exit__(None, None, None)
                 gating_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
+            mem_4 = torch.cuda.memory_allocated()
+            
 
-        if self.wall_clock_breakdown:
-            self.timers(FIRST_ALLTOALL_TIMER).start()
         # if groups._get_expert_model_parallel_world_size() == 1:
             # If the non-expert is tensor-parallel, it will create
             # duplicate tokens on the tensor-parallel ranks.
@@ -579,13 +601,7 @@ class MOELayer(Base):
             ********************************************************************
         """
         
-        # b.record()
-        # torch.cuda.synchronize()
-        # print("alltoall: {} ms".format(a.elapsed_time(b)))
-        if self.wall_clock_breakdown:
-            self.timers(FIRST_ALLTOALL_TIMER).stop()
-            self.time_falltoall = self.timers(FIRST_ALLTOALL_TIMER).elapsed(reset=False)
-
+        mem_5 = torch.cuda.memory_allocated()
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, d_model)
         if self.py_prof:
@@ -602,18 +618,17 @@ class MOELayer(Base):
             -----------------------CALL TO EXPERTS BEGINS HERE------------------
             ********************************************************************
         """
+        mem_6 = torch.cuda.memory_allocated()
+        # print("dispatched_input shape: ", dispatched_input.shape)
         expert_output = self.experts(dispatched_input)
+        # print("expert_output shape: ", expert_output.shape)
+        del dispatched_input
+        mem_7 = torch.cuda.memory_allocated()
         """
             ********************************************************************
             -----------------------CALL TO EXPERTS ENDS HERE--------------------
             ********************************************************************
         """
-        # end_aux_2 = torch.cuda.Event(enable_timing=True)
-        # end_aux_2.record()
-        if self.wall_clock_breakdown:
-            self.timers(SECOND_ALLTOALL_TIMER).start()
-        # if groups._get_expert_model_parallel_world_size() != 1:
-        # expert_output = _AllToAll.apply(self.ep_group, expert_output)
 
         """
             ********************************************************************
@@ -641,19 +656,13 @@ class MOELayer(Base):
             ********************************************************************
         """
 
-        if self.wall_clock_breakdown:
-            self.timers(SECOND_ALLTOALL_TIMER).stop()
-            self.time_salltoall = self.timers(SECOND_ALLTOALL_TIMER).elapsed(reset=False)
-
+       
         if self.py_prof:
                 prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
                 prof.__enter__()
         # Re-shape back: gecm -> ecm
-        if self.debug:
-            print("expert_output shape: ", expert_output.shape)
-            print(expert_output)
         expert_output = expert_output.reshape(self.ep_size * self.num_local_experts, -1, d_model)
-
+        mem_8 = torch.cuda.memory_allocated()
         # if groups._get_expert_model_parallel_world_size() == 1:
         #     # the dropped duplicate tokens need to be gathered on each
         #     # tensor parallel rank again for the tensor-parallel
@@ -667,12 +676,13 @@ class MOELayer(Base):
             # output = torch.empty_like(expert_output)
             torch.distributed.all_gather(tensor_list, expert_output)
             expert_output = torch.cat(tensor_list, dim=1).contiguous()
+        mem_9 = torch.cuda.memory_allocated()
         if self.py_prof:
                 prof.__exit__(None, None, None)
                 gather_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
         
         if self.use_tutel:
-            combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
+            combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))     
         else:
             if self.py_prof:
                 prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
@@ -681,25 +691,20 @@ class MOELayer(Base):
                 print("expert_output shape: ", expert_output.shape)
                 print("combine_weights shape: ", combine_weights.shape)
             combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
+            del expert_output
             if self.py_prof:
                 prof.__exit__(None, None, None)
                 combine_cuda_time = sum([e.cuda_time_total for e in prof.key_averages()])
-        a = combined_output.reshape(input[0].shape)
-        # with open('tensor_moe_1.txt', 'a') as f_object:
-        #     writer_object = csv.writer(f_object)
-        #     writer_object.writerow(a) 
-        # array = a.cpu().numpy()
-        # np.savetxt("tensor_moe_2.txt", array.reshape(-1), delimiter=",")
-        if self.wall_clock_breakdown:
-            self.timers(MOE_TIMER).stop()
-            self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
-        # end.record()
-        # torch.cuda.synchronize()
-        # print("moe second half {} ms".format(end_aux_2.elapsed_time(end)))
-        # print("moe forward pass took: {} ms".format(start.elapsed_time(end)))
+        mem_10 = torch.cuda.memory_allocated()
+        a = combined_output.reshape(input_shape)
+        mem_11 = torch.cuda.memory_allocated()
+        # print("py prof is: ", self.py_prof)
         if self.py_prof:
-            times.append((gating_cuda_time, reshape_n_comm_cuda_time, gather_cuda_time, combine_cuda_time))
+            timers.append((gating_cuda_time, reshape_n_comm_cuda_time, gather_cuda_time, combine_cuda_time))
+            # print("py prof is true, i exit, sharded_moe.py line 702")
         # print("rank: ", torch.distributed.get_rank(), " a: ", a.shape)
         # array = a.cpu().numpy()
         # np.savetxt(f"{torch.distributed.get_world_size()}_GPU_tensor_moe_{torch.distributed.get_rank()}_bothALL_TO_ALL.txt", array.reshape(-1), delimiter=",")
-        return a, times
+        mem_12 = torch.cuda.memory_allocated()
+        # print("mem_0: ", mem_0, " mem_1: ", mem_1, " mem_3: ", mem_3, " mem_4: ", mem_4, " mem_5: ", mem_5, " mem_6: ", mem_6, " mem_7: ", mem_7, " mem_8: ", mem_8, " mem_9: ", mem_9, " mem_10: ", mem_10, " mem_11: ", mem_11, " mem_12: ", mem_12)
+        return a, timers

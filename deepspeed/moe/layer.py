@@ -61,7 +61,7 @@ class MoE(torch.nn.Module):
         self.expert_group_name = f"ep_size_{self.ep_size}"
         self.num_experts = num_experts
         self.num_local_experts = num_experts // self.ep_size
-
+        
         log_dist(
             f'Creating MoE layer with num_experts: {num_experts} | num_local_experts: {self.num_local_experts} | expert_parallel_size: {self.ep_size}',
             [0])

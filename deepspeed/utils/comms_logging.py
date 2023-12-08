@@ -52,7 +52,7 @@ def calc_bw_log(comm_op, size, duration):
         busbw = tput
     else:
         print_rank_0("wrong comm_op specified")  # noqa: F821
-        exit(0)
+        # exit(0)
 
     # convert to Gbps
     tput *= 8
